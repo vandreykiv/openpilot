@@ -1,36 +1,39 @@
 from common.numpy_fast import clip, interp
-from selfdrive.car.tesla.values import CruiseButtons
-from selfdrive.car.tesla.tunes import pedal_kpBP, pedal_kpV,pedal_kiBP, pedal_kiV,pedal_kdBP, pedal_kdV, V_PID_FILE,gasMaxBP, gasMaxV, brakeMaxBP, brakeMaxV
+from selfdrive.car.tesla.values import CruiseButtons,TESLA_MIN_ACCEL
 from selfdrive.config import Conversions as CV
 import time
-from cereal import car
+from common.params import Params
 from selfdrive.car.modules.CFG_module import load_float_param
-from selfdrive.controls.lib.pid_real import  PIDController
-import json
+from selfdrive.car.tesla.tunes import PEDAL_BP, PEDAL_V
+from cereal import car
+
+ACCEL_MAX = 2.5  #0.6m/s2 * 36 = ~ 0 -> 50mph in 6 seconds
+ACCEL_MIN = TESLA_MIN_ACCEL
 
 
-_DT = 0.05  # 20Hz in our case, since we don't want to process more than once the same radarState message
-
-ACCEL_MAX = 0.6  #0.6m/s2 * 36 = ~ 0 -> 50mph in 6 seconds
-ACCEL_MIN = -0.5 #changed from -3.5 to -4.5 to see if we get better braking with iBooster
-MAX_BRAKE_VALUE = 1 #ibooster fully pressed BBTODO determine the exact value we need
-BRAKE_LOOKUP_BP = [ACCEL_MIN, interp(0.0,brakeMaxBP,brakeMaxV)]
-BRAKE_LOOKUP_V = [MAX_BRAKE_VALUE, 0.]
-PID_UNWIND_RATE = 0.6 * _DT
-PID_UNWIND_RATE_IBOOSTER = 0.4 * _DT
+_DT = 0.01  # 100Hz
+_DT_MPC = _DT
 
 # TODO: these should end up in values.py at some point, probably variable by trim
 # Accel limits
 MAX_RADAR_DISTANCE = 120.0  # max distance to take in consideration radar reading
-MAX_PEDAL_VALUE = 60
-MAX_PEDAL_REGEN_VALUE = -7
+
+MAX_PEDAL_VALUE_AVG = 60
+
+MAX_BRAKE_VALUE = 1. #ibooster fully pressed BBTODO determine the exact value we need
+
 PEDAL_HYST_GAP = (
     1.0  # don't change pedal command for small oscilalitons within this value
 )
-# Cap the pedal to go from 0 to max in 6 seconds
-PEDAL_MAX_UP = (MAX_PEDAL_VALUE - MAX_PEDAL_REGEN_VALUE) * _DT / 6
+
 # Cap the pedal to go from max to 0 in 0.4 seconds
-PEDAL_MAX_DOWN = (MAX_PEDAL_VALUE - MAX_PEDAL_REGEN_VALUE) * _DT / 0.4
+PEDAL_MAX_DOWN = MAX_PEDAL_VALUE_AVG * _DT / 0.4
+PEDAL_MAX_UP = MAX_PEDAL_VALUE_AVG * _DT / 8.
+
+
+# BBTODO: move the vehicle variables; maybe make them speed variable
+TORQUE_LEVEL_ACC = 0.0
+TORQUE_LEVEL_DECEL = -30.0
 
 MIN_PCC_V_KPH = 0.0  #
 MAX_PCC_V_KPH = 270.0
@@ -38,8 +41,8 @@ MAX_PCC_V_KPH = 270.0
 # Pull the cruise stalk twice in this many ms for a 'double pull'
 STALK_DOUBLE_PULL_MS = 750
 
-T_FOLLOW = load_float_param("TinklaFollowDistance",1.45)
 PEDAL_PROFILE = int(load_float_param("TinklaPedalProfile",2.0)-1)
+
 
 class PCCState:
     # Possible state of the PCC system, following the DI_cruiseState naming scheme.
@@ -55,77 +58,63 @@ def _current_time_millis():
 
 # this is for the pedal cruise control
 class PCCController:
-
-    @staticmethod
-    def compute_gb(accel, speed):
-        # TODO: is this correct?
-        return float(accel) #/ 3.0
-
     def __init__(self, longcontroller,tesla_can,pedalcan,CP):
-        self.LongCtr = longcontroller
         self.CP = CP
-        self.carFingerprint = CP.carFingerprint
+        self.LongCtr = longcontroller
         self.tesla_can = tesla_can
+        self.human_cruise_action_time = 0
         self.pcc_available = self.prev_pcc_available = False
         self.pedal_timeout_frame = 0
+        self.accelerator_pedal_pressed = self.prev_accelerator_pedal_pressed = False
+        self.automated_cruise_action_time = 0
+        self.last_angle = 0.0
         self.lead_1 = None
+        self.last_update_time = 0
         self.enable_pedal_cruise = False
         self.stalk_pull_time_ms = 0
         self.prev_stalk_pull_time_ms = -1000
+        self.prev_cruise_state = 0
         self.prev_cruise_buttons = CruiseButtons.IDLE
         self.pedal_speed_kph = 0.0
         self.speed_limit_kph = 0.0
         self.prev_speed_limit_kph = 0.0
         self.pedal_idx = 0
         self.pedal_steady = 0.0
+        self.prev_tesla_accel = 0.0
         self.prev_tesla_pedal = 0.0
         self.prev_tesla_brake = 0.0
+        self.torqueLevel_last = 0.0
+        self.prev_v_ego = 0.0
+        self.PedalForZeroTorque = (
+            0.0  # starting number, adjusts automatically
+        )
+        self.lastTorqueForPedalForZeroTorque = TORQUE_LEVEL_DECEL
         self.v_pid = 0.0
+        self.a_pid = 0.0
+        self.last_output_gb = 0.0
+        self.last_speed_kph = None
+        # for smoothing the changes in speed
+        self.v_acc_start = 0.0
+        self.a_acc_start = 0.0
+        self.v_acc = 0.0
+        self.v_acc_sol = 0.0
+        self.v_acc_future = 0.0
+        self.a_acc = 0.0
+        self.a_acc_sol = 0.0
+        self.v_cruise = 0.0
+        self.a_cruise = 0.0
+ 
+        # when was radar data last updated?
+        self.lead_last_seen_time_ms = 0
+        self.continuous_lead_sightings = 0
+        self.params = Params()
         self.pedalcan = pedalcan
-        self.pid = PIDController((pedal_kpBP, pedal_kpV),
-          (pedal_kiBP, pedal_kiV),
-          (pedal_kdBP,pedal_kdV),
-          rate=1/_DT,
-          sat_limit=0.8,
-          convert=self.compute_gb)
-        self.pid.i_unwind_rate = PID_UNWIND_RATE
-        self.load_pid()
+        self.madMax = False
+        #if longcontroller.madMax:
+        #    self.madMax = True
 
-    def load_pid(self):
-        try:
-            v_pid_json = open(V_PID_FILE)
-            data = json.load(v_pid_json)
-            if self.pid:
-                self.pid.p = data["p"]
-                self.pid.i = data["i"]
-                if "d" not in data:
-                    self.pid.d = 0.01
-                else:
-                    self.pid.d = data["d"]
-                self.pid.f = data["f"]
-            else:
-                print("self.pid not initialized!")
-        except IOError:
-            print("file not present, creating at next reset")
-
-    def save_pid(self):
-        data = {}
-        data["p"] = self.pid.p
-        data["i"] = self.pid.i
-        data["d"] = self.pid.d
-        data["f"] = self.pid.f
-        try:
-            with open(V_PID_FILE, "w") as outfile:
-                json.dump(data, outfile)
-        except IOError:
-           print("PDD pid parameters could not be saved to file")
-
-    def reset(self, v_pid):
-        """Reset PID controller and change setpoint"""
-        self.v_pid = v_pid
 
     def update_stat(self, CS, frame):
-        
         if not self.LongCtr.CP.openpilotLongitudinalControl:
             self.pcc_available = False
             return []
@@ -149,7 +138,7 @@ class PCCController:
                     )
             return can_sends
 
-        prev_enable_pedal_cruise = self.enable_pedal_cruise
+        #prev_enable_pedal_cruise = self.enable_pedal_cruise
         # disable on brake
         if CS.realBrakePressed and self.enable_pedal_cruise:
             CS.longCtrlEvent = car.CarEvent.EventName.pccDisabled
@@ -234,9 +223,7 @@ class PCCController:
 
         # Update prev state after all other actions.
         self.prev_cruise_buttons = CS.cruise_buttons
-        if prev_enable_pedal_cruise and not self.enable_pedal_cruise:
-            #we just chanceled, save PID
-            self.save_pid()
+        self.prev_cruise_state = CS.cruise_state
 
         return can_sends
 
@@ -247,13 +234,14 @@ class PCCController:
         frame,
         actuators,
         v_target,
+        a_pid,
         a_target,
         pcm_override,
         speed_limit_ms,
         set_speed_limit_active,
         speed_limit_offset,
         alca_enabled,
-        radar_state
+        radSt
     ):
 
         if not self.LongCtr.CP.openpilotLongitudinalControl:
@@ -264,13 +252,24 @@ class PCCController:
 
         idx = self.pedal_idx
 
-        if CS.has_ibooster_ecu:
-            self.pid.i_unwind_rate = PID_UNWIND_RATE_IBOOSTER
-
         self.prev_speed_limit_kph = self.speed_limit_kph
 
-        if radar_state is not None:
-                self.lead_1 = radar_state.radarState.leadOne
+        ######################################################################################
+        # Determine pedal "zero"
+        #
+        # save position for cruising (zero acc, zero brake, no torque) when we are above 10 MPH
+        ######################################################################################
+        if (
+            CS.torqueLevel < TORQUE_LEVEL_ACC
+            and CS.torqueLevel > TORQUE_LEVEL_DECEL
+            and CS.out.vEgo >= 10.0 * CV.MPH_TO_MS
+            and abs(CS.torqueLevel) < abs(self.lastTorqueForPedalForZeroTorque)
+        ):
+            self.PedalForZeroTorque = self.prev_tesla_pedal
+            self.lastTorqueForPedalForZeroTorque = CS.torqueLevel
+            # print ("Detected new Pedal For Zero Torque at %s" % (self.PedalForZeroTorque))
+            # print ("Torque level at detection %s" % (CS.torqueLevel))
+            # print ("Speed level at detection %s" % (CS.out.vEgo * CV.MS_TO_MPH))
 
         if set_speed_limit_active and speed_limit_ms > 0:
             self.speed_limit_kph = (speed_limit_ms + speed_limit_offset) * CV.MS_TO_KPH
@@ -281,64 +280,72 @@ class PCCController:
         self.pedal_idx = (self.pedal_idx + 1) % 16
 
         if not self.pcc_available or not enabled:
-            self.reset(CS.out.vEgo)
             return 0.0, 0.0, 0, idx
 
-        self.v_pid = v_target
+        ##############################################################
+        # This mode uses the longitudinal MPC built in OP
+        #
+        # we use the values from a_pid
+        ##############################################################
+        ZERO_ACCEL = self.PedalForZeroTorque
+        REGEN_DECEL = -0.8 #BB needs to be calculated based on regen available, which is higher at lower speeds...
+        if CS.out.vEgo < 5 * CV.MPH_TO_MS and PEDAL_PROFILE > 0:
+            ZERO_ACCEL = 0.
 
-        #TODO: ibstBrakeApplied use that to determine if iBooster is still being pressed
-        # to prevent both pedals being on
-
-        prevent_overshoot = not self.CP.stoppingControl and CS.out.vEgo < 1.5 and v_target < 0.7 and v_target < self.v_pid
-        deadzone = interp(CS.out.vEgo, self.CP.longitudinalTuning.deadzoneBP, self.CP.longitudinalTuning.deadzoneV)
-        freeze_integrator = prevent_overshoot
+        if CS.out.vEgo < 5 * CV.MPH_TO_MS and PEDAL_PROFILE == 0 and a_target > 0.01:
+            ZERO_ACCEL = 0.
+                
+        MAX_PEDAL_BP = PEDAL_BP
+        MAX_PEDAL_V = PEDAL_V[PEDAL_PROFILE]
+        MAX_PEDAL_VALUE = interp(CS.out.vEgo, MAX_PEDAL_BP, MAX_PEDAL_V)
         
-        gas_max = interp(CS.out.vEgo, gasMaxBP, gasMaxV[PEDAL_PROFILE])
-        brake_max = interp(CS.out.vEgo, brakeMaxBP, brakeMaxV)
-        if CS.has_ibooster_ecu:
-            brake_max = ACCEL_MIN
-        self.pid.neg_limit = brake_max
-        self.pid.pos_limit = gas_max
+        MIN_PEDAL_REGEN_VALUE = -7.
+        MAX_PEDAL_REGEN_VALUE = -7.
+        if not CS.has_ibooster_ecu:
+            MAX_PEDAL_REGEN_VALUE = -20.
+        if PEDAL_PROFILE == 0: #Tesla Model S 60kW
+            MAX_PEDAL_REGEN_VALUE = 0.
+            MIN_PEDAL_REGEN_VALUE = 0.
         
-        if self.enable_pedal_cruise:
-            tesla_pedal = self.pid.update(self.v_pid, CS.out.vEgo, speed=CS.out.vEgo, 
-                        deadzone=deadzone, feedforward=a_target, 
-                        freeze_integrator=freeze_integrator)
-            enable_pedal = 1.0
-        else:
-            tesla_pedal = 0.0
-            enable_pedal = 0.0
-            self.reset(CS.out.vEgo)
-        tesla_brake = clip(tesla_pedal,ACCEL_MIN,interp(CS.out.vEgo, brakeMaxBP, brakeMaxV))
-        tesla_pedal = clip(tesla_pedal, interp(CS.out.vEgo, brakeMaxBP, brakeMaxV), gas_max)
-        tesla_pedal = int((tesla_pedal -0.07)* 100)
+        ACCEL_LOOKUP_BP = [REGEN_DECEL, 0., ACCEL_MAX]
+        ACCEL_LOOKUP_V = [MAX_PEDAL_REGEN_VALUE, ZERO_ACCEL, MAX_PEDAL_VALUE]
 
+        #we can't use above until we decide how to handle regen
+        BRAKE_LOOKUP_BP = [ACCEL_MIN, 0]
+        BRAKE_LOOKUP_V = [MAX_BRAKE_VALUE, 0.]
+
+        enable_pedal = 1.0 if self.enable_pedal_cruise else 0.0
+        tesla_pedal = int(round(interp(a_pid, ACCEL_LOOKUP_BP, ACCEL_LOOKUP_V)))
+        #only do pedal hysteresis when very close to speed set
         if abs(CS.out.vEgo * CV.MS_TO_KPH - self.pedal_speed_kph) < 0.5:
             tesla_pedal = self.pedal_hysteresis(tesla_pedal, enable_pedal)
-        if CS.out.vEgo < 0.1 and actuators.accel < 0.01:
+        if (CS.out.vEgo < 0.1) and (
+                (a_target < 0.01 and PEDAL_PROFILE == 0) 
+                or
+                (a_pid < 0.01 and PEDAL_PROFILE > 0)
+        ):
             #hold brake pressed at when standstill
             #BBTODO: show HOLD indicator in IC with integration
             # for about 14psi to hold a car even on slopes 
             # we need roughty 6.5 mm / 15 = 
             tesla_brake = 0.43
         else:
-            tesla_brake = interp(tesla_brake, BRAKE_LOOKUP_BP, BRAKE_LOOKUP_V)
+            tesla_brake = interp(a_pid, BRAKE_LOOKUP_BP, BRAKE_LOOKUP_V)
+        # if gas pedal pressed, brake should be zero (we alwasys have pedal with ibooster)
+        if CS.pedal_interceptor_value > max(5.,ZERO_ACCEL):
+            tesla_brake = 0
+        if CS.has_ibooster_ecu and CS.brakeUnavailable:
+            CS.longCtrlEvent = car.CarEvent.EventName.iBoosterBrakeNotOk
 
         tesla_pedal = clip(tesla_pedal, self.prev_tesla_pedal - PEDAL_MAX_DOWN, self.prev_tesla_pedal + PEDAL_MAX_UP)
-
-        # if gas pedal pressed, brake should be zero (we alwasys have pedal with ibooster)
-        # if CS.has_ibooster_ecu:
-        #     if CS.brakeUnavailable:
-        #         CS.longCtrlEvent = car.CarEvent.EventName.iBoosterBrakeNotOk
-        #     if self.prev_tesla_pedal > 0:
-        #         tesla_brake = 0
-        #     if self.prev_tesla_brake > 0:
-        #         tesla_pedal = MAX_PEDAL_REGEN_VALUE
-         
         
+        if CS.ibstBrakeApplied:
+            #waiting on ibooster to unwind to accelerate
+            tesla_pedal = min(tesla_pedal,MIN_PEDAL_REGEN_VALUE) 
         self.prev_tesla_brake = tesla_brake * enable_pedal
+        self.torqueLevel_last = CS.torqueLevel
         self.prev_tesla_pedal = tesla_pedal * enable_pedal
-        #print("pedal=",self.prev_tesla_pedal, "   brake=", self.prev_tesla_brake)
+        self.prev_v_ego = CS.out.vEgo
         return self.prev_tesla_pedal, self.prev_tesla_brake, enable_pedal, idx
 
     def pedal_hysteresis(self, pedal, enabled):

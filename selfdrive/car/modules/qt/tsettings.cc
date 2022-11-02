@@ -63,12 +63,6 @@ TinklaTogglesPanel::TinklaTogglesPanel(SettingsWindow *parent) : ListWidget(pare
       "../assets/offroad/icon_warning.png",
       "","","",0.0,0.0,0.0,0.0, TINKLA_TOGGLE
       },
-    {"TinklaHasPerfMotor",
-      "Is Tesla Performance",
-      "Enable if your Tesla has the Performance motors",
-      "../assets/offroad/icon_warning.png",
-      "","","",0.0,0.0,0.0,0.0, TINKLA_TOGGLE
-      },
     {"TinklaTurnScreenOff",
       "Turn screen off while engaged",
       "Keeps device screen off even when engaged. It wakes the screen any time a message is shown.",
@@ -187,12 +181,12 @@ TeslaPreApTogglesPanel::TeslaPreApTogglesPanel(SettingsWindow *parent) : ListWid
     },
     {"TinklaPedalProfile",
       "Pedal Profile",
-      "The profile to be used with the Tinkla Pedal Interceptor. 1 (S60) to 3 (SP+)",
+      "The profile to be used with the Tinkla Pedal Interceptor. 1 (fast accel) to 4 (slow accel)",
       "../assets/offroad/icon_speed_limit.png",
       "Pedal Interceptor Profile:",
       "Enter profile #.",
       "",
-      2.0,1.0,3.0,1.0,TINKLA_FLOAT
+      2.0,1.0,4.0,1.0,TINKLA_FLOAT
     },
     {"TinklaAutoResumeACC",
     "AutoResume ACC",
@@ -236,15 +230,15 @@ TeslaPreApTogglesPanel::TeslaPreApTogglesPanel(SettingsWindow *parent) : ListWid
       "m",
       0.0,-1.0,1.0,0.01,TINKLA_FLOAT
     },
-    {"TinklaHasIBooster",
-    "Car has iBooster",
-    "Set to true if you retrofitted Tesla Model S iBooster on pre-AutoPilot cars. Requires reboot.",
+    {"TinklaUseTeslaRadarUpsideDown",
+    "Use Radar Upside Down",
+    "Allows one to install the Tesla Radar upside down.",
     "../assets/offroad/icon_settings.png",
     "","","",0.0,0.0,0.0,0.0, TINKLA_TOGGLE
     },
-    {"TinklaUseBrakeWipe",
-    "Use Brake Wipe",
-    "Spams CAN bus with brake wipe request when needed to slow down. Alpha grade feature. Requires reboot.",
+    {"TinklaHasIBooster",
+    "Car has iBooster",
+    "Set to true if you retrofitted Tesla Model S iBooster on pre-AutoPilot cars. Requires reboot.",
     "../assets/offroad/icon_settings.png",
     "","","",0.0,0.0,0.0,0.0, TINKLA_TOGGLE
     },
@@ -341,12 +335,21 @@ TeslaTogglesPanel::TeslaTogglesPanel(SettingsWindow *parent) : ListWidget(parent
     },
     {"TinklaTurnSlowdownFactor",
       "Slowdown Factor in Turns",
-      "The multiplier used to compute the safe speed to take a turn. 0.9 is slower, 1.0 is faster.",
+      "The multiplier used to compute the safe speed to take a turn. 0.8 is slower, 1.2 is faster.",
       "../assets/offroad/icon_speed_limit.png",
       "Slowdown Factor in Turns:",
       "Enter the slowdown multiplier:",
       "",
-      0.95,0.9,1.0,0.01,TINKLA_FLOAT
+      0.95,0.8,1.2,0.01,TINKLA_FLOAT
+    },
+    {"TinklaBrakeFactor",
+      "Braking Factor",
+      "The multiplier used to compute the Tesla braking power. 0.8 is slower, 1.2 is faster.",
+      "../assets/offroad/icon_speed_limit.png",
+      "Braking Factor:",
+      "Enter the braking multiplier:",
+      "",
+      1.0,0.8,1.2,0.01,TINKLA_FLOAT
     },
     {"TinklaSpeedMadMax",
     "Use MadMax Mode",
